@@ -1,0 +1,16 @@
+// niri-ws-mode: per-workspace tiled/floating mode.
+// Include this file from your niri config:
+//
+//     include "niri-ws-mode.kdl"
+//
+// `install.sh` links it to ~/.config/niri/niri-ws-mode.kdl.
+// niri merges `binds` and `spawn-at-startup` from included files.
+
+binds {
+    Mod+Ctrl+T hotkey-overlay-title="Toggle workspace tiled/floating mode" {
+        spawn-sh "~/.local/bin/niri-ws-mode toggle";
+    }
+}
+
+// Floats new windows that open on a floating workspace.
+spawn-sh-at-startup "~/.local/bin/niri-ws-mode daemon"

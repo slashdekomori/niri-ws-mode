@@ -1,0 +1,352 @@
+#!/usr/bin/env python3
+"""Per-workspace tiling/floating mode for niri.
+
+niri-ws-mode toggle   flip the focused workspace between tiled and floating
+niri-ws-mode daemon   float new windows that appear on floating workspaces
+niri-ws-mode status   print the mode of the focused workspace
+niri-ws-mode float W  float one window (W = niri window JSON); used by the daemon
+"""
+
+import fcntl
+import json
+import os
+import subprocess
+import sys
+import time
+
+# Floating size relative to the tiled size (0.5 = half, 0.67 = a third smaller).
+FLOAT_SCALE = float(os.environ.get("NIRI_WS_MODE_SCALE", "0.8"))
+# Space kept free between floating windows and the screen edge, in px.
+EDGE_GAP = 8
+# Resolution of the search for a free spot, in px.
+PLACE_STEP = 20
+# How long to wait for apps to settle before re-checking their size.
+SETTLE_DELAY = 0.3
+
+RUNTIME = os.environ.get("XDG_RUNTIME_DIR", "/tmp")
+STATE_FILE = os.path.join(RUNTIME, "niri-ws-mode.json")
+STATE_LOCK = os.path.join(RUNTIME, "niri-ws-mode.state.lock")
+DAEMON_LOCK = os.path.join(RUNTIME, "niri-ws-mode.lock")
+
+
+def niri(*args):
+    return subprocess.run(["niri", "msg", *args], capture_output=True, text=True)
+
+
+def niri_json(*args):
+    return json.loads(niri("--json", *args).stdout)
+
+
+def action(name, *args, win=None):
+    cmd = ["action", name]
+    if win is not None:
+        cmd += ["--id", str(win)]
+    niri(*cmd, *args)
+
+
+def load_state():
+    try:
+        with open(STATE_FILE) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        data = {}
+    if "workspaces" not in data and "tiled" not in data:
+        data = {"workspaces": {k: v for k, v in data.items() if isinstance(v, str)}}
+    return {
+        "workspaces": data.get("workspaces", {}),
+        "tiled": data.get("tiled", {}),
+    }
+
+
+def mutate_state(fn):
+    with open(STATE_LOCK, "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        state = load_state()
+        fn(state)
+        tmp = STATE_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(state, f)
+        os.replace(tmp, STATE_FILE)
+
+
+def mode_of(ws_id):
+    return load_state()["workspaces"].get(str(ws_id), "tiled")
+
+
+def prune_workspaces(workspaces):
+    live = {str(w["id"]) for w in workspaces}
+
+    def fn(state):
+        state["workspaces"] = {
+            k: v for k, v in state["workspaces"].items() if k in live
+        }
+
+    mutate_state(fn)
+
+
+def prune_windows(windows):
+    live = {str(w["id"]) for w in windows}
+
+    def fn(state):
+        state["tiled"] = {k: v for k, v in state["tiled"].items() if k in live}
+
+    mutate_state(fn)
+
+
+def forget_window(win_id):
+    mutate_state(lambda state: state["tiled"].pop(str(win_id), None))
+
+
+def window_size(win):
+    layout = win.get("layout") or {}
+    size = layout.get("window_size")
+    if not size:
+        fresh = next((w for w in niri_json("windows") if w["id"] == win["id"]), None)
+        size = ((fresh or {}).get("layout") or {}).get("window_size")
+    return size
+
+
+def apply_size(win_id, size):
+    action("set-window-width", str(size[0]), win=win_id)
+    action("set-window-height", str(size[1]), win=win_id)
+
+
+def to_floating(win):
+    """Float a window at FLOAT_SCALE of its tiled size. Returns the size set."""
+    size = window_size(win)
+    target = None
+    if size:
+        saved = list(size)
+        mutate_state(lambda state: state["tiled"].__setitem__(str(win["id"]), saved))
+        target = [max(1, int(s * FLOAT_SCALE)) for s in size]
+    action("move-window-to-floating", win=win["id"])
+    if target:
+        apply_size(win["id"], target)
+    return target
+
+
+def to_tiling(win):
+    """Tile a window again and restore the width it had before it floated."""
+    saved = None
+
+    def fn(state):
+        nonlocal saved
+        saved = state["tiled"].pop(str(win["id"]), None)
+
+    mutate_state(fn)
+    action("move-window-to-tiling", win=win["id"])
+    if saved:
+        action("set-window-width", str(saved[0]), win=win["id"])
+        action("reset-window-height", win=win["id"])
+
+
+def overlap(a, b):
+    w = min(a[0] + a[2], b[0] + b[2]) - max(a[0], b[0])
+    h = min(a[1] + a[3], b[1] + b[3]) - max(a[1], b[1])
+    return w * h if w > 0 and h > 0 else 0
+
+
+def axis_candidates(total, length):
+    lo, hi = EDGE_GAP, int(total - length - EDGE_GAP)
+    if hi < lo:
+        return [max(0, int((total - length) // 2))]
+    values = list(range(lo, hi + 1, PLACE_STEP))
+    if values[-1] != hi:
+        values.append(hi)
+    return values
+
+
+def best_position(size, placed, area, preferred):
+    """Spot with the least overlap; ties go to the one nearest `preferred`."""
+    w, h = size
+    best, best_key = (0, 0), None
+    for y in axis_candidates(area[1], h):
+        for x in axis_candidates(area[0], w):
+            rect = (x, y, w, h)
+            covered = sum(overlap(rect, other) for other in placed)
+            dist = (x + w / 2 - preferred[0]) ** 2 + (y + h / 2 - preferred[1]) ** 2
+            key = (covered, dist)
+            if best_key is None or key < best_key:
+                best, best_key = (x, y), key
+    return best
+
+
+def arrange(ws_id, movers):
+    """Place floating windows so they cover each other (and others) as little as possible.
+
+    movers: list of (window id, size or None), in the order they should sit
+    from left to right.
+    """
+    if not movers:
+        return
+    ids = {wid for wid, _ in movers}
+
+    # Centering the first window reveals the real working area (bars, docks).
+    action("center-window", win=movers[0][0])
+    windows = {w["id"]: w for w in niri_json("windows")}
+
+    first = (windows.get(movers[0][0]) or {}).get("layout") or {}
+    pos, tile = first.get("tile_pos_in_workspace_view"), first.get("tile_size")
+    if pos and tile:
+        area = (2 * (pos[0] + tile[0] / 2), 2 * (pos[1] + tile[1] / 2))
+    else:
+        ws = next((w for w in niri_json("workspaces") if w["id"] == ws_id), None)
+        out = niri_json("outputs").get(ws["output"]) if ws else None
+        logical = (out or {}).get("logical") or {"width": 1920, "height": 1080}
+        area = (logical["width"], logical["height"])
+
+    placed = []
+    for w in windows.values():
+        layout = w.get("layout") or {}
+        if (
+            w["workspace_id"] == ws_id
+            and w["is_floating"]
+            and w["id"] not in ids
+            and layout.get("tile_pos_in_workspace_view")
+        ):
+            x, y = layout["tile_pos_in_workspace_view"]
+            placed.append((x, y, *layout["tile_size"]))
+
+    for i, (wid, target) in enumerate(movers):
+        win = windows.get(wid)
+        if win is None:
+            continue
+        size = target or (win.get("layout") or {}).get("tile_size")
+        if not size:
+            continue
+        preferred = ((i + 0.5) / len(movers) * area[0], area[1] / 2)
+        x, y = best_position(size, placed, area, preferred)
+        action("move-floating-window", "-x", str(x), "-y", str(y), win=wid)
+        placed.append((x, y, *size))
+
+
+def settle(ws_id, movers):
+    """Some apps ignore or override the requested size; re-apply once, then re-place."""
+    time.sleep(SETTLE_DELAY)
+    windows = {w["id"]: w for w in niri_json("windows")}
+    redo = []
+    for wid, target in movers:
+        win = windows.get(wid)
+        tile = ((win or {}).get("layout") or {}).get("tile_size")
+        if not win or not win["is_floating"] or not target or not tile:
+            continue
+        if abs(tile[0] - target[0]) > 3 or abs(tile[1] - target[1]) > 3:
+            apply_size(wid, target)
+            redo.append((wid, None))
+    if redo:
+        time.sleep(0.1)
+        arrange(ws_id, redo)
+
+
+def notify(text):
+    subprocess.Popen(
+        ["notify-send", "-a", "niri-ws-mode", "-t", "1500", "Workspace mode", text],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def focused_workspace():
+    return next((w for w in niri_json("workspaces") if w["is_focused"]), None)
+
+
+def tiled_order(win):
+    return (win.get("layout") or {}).get("pos_in_scrolling_layout") or [0, 0]
+
+
+def cmd_toggle():
+    ws = focused_workspace()
+    if ws is None:
+        return
+    new = "tiled" if mode_of(ws["id"]) == "floating" else "floating"
+    mutate_state(lambda state: state["workspaces"].__setitem__(str(ws["id"]), new))
+
+    windows = [w for w in niri_json("windows") if w["workspace_id"] == ws["id"]]
+    if new == "floating":
+        movers = []
+        for win in sorted(
+            (w for w in windows if not w["is_floating"]), key=tiled_order
+        ):
+            movers.append((win["id"], to_floating(win)))
+        arrange(ws["id"], movers)
+        settle(ws["id"], movers)
+    else:
+        for win in windows:
+            if win["is_floating"]:
+                to_tiling(win)
+    notify(f"{ws.get('name') or ws['idx']}: {new}")
+
+
+def cmd_status():
+    ws = focused_workspace()
+    print(mode_of(ws["id"]) if ws else "tiled")
+
+
+def cmd_float(raw_window):
+    win = json.loads(raw_window)
+    target = to_floating(win)
+    movers = [(win["id"], target)]
+    arrange(win["workspace_id"], movers)
+    settle(win["workspace_id"], movers)
+
+
+def float_new_window(win):
+    # A fresh process, so edits to this script apply without restarting the daemon.
+    subprocess.Popen(
+        [sys.executable, os.path.abspath(__file__), "float", json.dumps(win)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def cmd_daemon():
+    lock = open(DAEMON_LOCK, "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        sys.exit(0)
+
+    known = {}  # window id -> workspace id
+    proc = subprocess.Popen(
+        ["niri", "msg", "--json", "event-stream"],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    for line in proc.stdout:
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+
+        if "WorkspacesChanged" in event:
+            prune_workspaces(event["WorkspacesChanged"]["workspaces"])
+        elif "WindowsChanged" in event:
+            windows = event["WindowsChanged"]["windows"]
+            known = {w["id"]: w["workspace_id"] for w in windows}
+            prune_windows(windows)
+        elif "WindowClosed" in event:
+            win_id = event["WindowClosed"]["id"]
+            known.pop(win_id, None)
+            forget_window(win_id)
+        elif "WindowOpenedOrChanged" in event:
+            win = event["WindowOpenedOrChanged"]["window"]
+            ws_id = win.get("workspace_id")
+            if ws_id is None:
+                continue
+            moved = known.get(win["id"]) != ws_id
+            known[win["id"]] = ws_id
+            if moved and not win["is_floating"] and mode_of(ws_id) == "floating":
+                float_new_window(win)
+
+
+COMMANDS = {
+    "toggle": cmd_toggle,
+    "daemon": cmd_daemon,
+    "status": cmd_status,
+    "float": cmd_float,
+}
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
+        sys.exit(__doc__)
+    COMMANDS[sys.argv[1]](*sys.argv[2:])
